@@ -599,9 +599,9 @@ def get_attention_backend(
             use_fused_attention = False
         elif head_dim_qk != head_dim_v:
             logger.debug(
-                "Disabling FusedAttention as it does not support context parallelism with MLA"
+                "Make Fused Attn work with context parallelism with MLA"
             )
-            use_fused_attention = False
+            use_fused_attention = True
 
     # Filter: Attention mask
     # attn_mask_type              | attention_mask                       | supported backends
@@ -1856,6 +1856,12 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         fwd_results_correction_done = torch.cuda.Event()
 
         p2p_comm_buffers = [None for _ in range(cp_size)]
+        head_dim_qk = k.shape[-1]
+        head_dim_v = v.shape[-1]
+        enable_mla = False
+        if head_dim_qk != head_dim_v:
+            v = F.pad(v, (0, head_dim_qk - head_dim_v))
+            enable_mla = True
         if use_fused_attention and qkv_format in ["bshd", "sbhd"]:
             p2p_comm_buffers[0] = torch.cat((k.unsqueeze(-3), v.unsqueeze(-3)), dim=-3)
         else:
@@ -2434,7 +2440,11 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
             fp8_meta["scaling_fwd"].amax_history[0][META_S] = amax_cp_fwd[0]
             fp8_meta["scaling_fwd"].amax_history[0][META_O_CP] = amax_cp_fwd[1]
 
+       
         out_fp8 = None
+        if enable_mla:
+            out = out[..., 0:head_dim_v].contiguous()
+        
         out_f16 = out.to(qkv_dtype)
         if fp8 and (is_output_fp8 or int(os.getenv("NVTE_FP8_DPA_BWD", "1"))):
             out_fp8 = cast_to_fp8(out_f16, fp8_meta["scaling_fwd"], META_O, fp8_dtype_forward)
@@ -2493,6 +2503,10 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
             *rng_states,
             *attn_biases,
         )
+        ctx.enable_mla = enable_mla
+        ctx.head_dim_qk = head_dim_qk
+        ctx.head_dim_v = head_dim_v
+
         ctx.cp_group_a2a = cp_group_a2a
         ctx.cp_size_a2a = cp_size_a2a
         ctx.rank_a2a = rank_a2a
@@ -2531,10 +2545,17 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         (*saved_tensors,) = ctx.saved_tensors
         (q, kv, out, softmax_lse, cu_seqlens_q_padded, cu_seqlens_kv_padded) = saved_tensors[:6]
         (fp8_fwd_scales, fp8_fwd_scale_invs) = saved_tensors[6:8]
+
+
+        if ctx.enable_mla:
+            out = F.pad(out, (0, ctx.head_dim_qk - ctx.head_dim_v))
+            dout = F.pad(dout, (0, ctx.head_dim_qk - ctx.head_dim_v))
         cu_seqlens_q_per_step = saved_tensors[8 : 8 + cp_size]
         cu_seqlens_kv_per_step = saved_tensors[8 + cp_size : 8 + cp_size * 2]
         rng_states = saved_tensors[8 + cp_size * 2 : 8 + cp_size * 3]
         attn_biases = saved_tensors[8 + cp_size * 3 : 8 + cp_size * 4]
+
+
 
         causal = "causal" in ctx.attn_mask_type
         padding = "padding" in ctx.attn_mask_type
@@ -3301,6 +3322,9 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         if attn_dbias is not None:
             # [b, np, sq, 2*cp, sk//(2*cp)] -> [b, np, sq, sk]
             attn_dbias = attn_dbias.view(*attn_dbias.shape[:-2], -1)
+
+        if ctx.enable_mla:
+            dv = dv[..., 0 : ctx.head_dim_v].contiguous()
 
         return (
             None,
